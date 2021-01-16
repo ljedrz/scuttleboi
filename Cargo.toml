@@ -11,6 +11,7 @@ pea2pea = "0.14"
 private-box = "0.6"
 serde = "1"
 serde_json = "1"
+ssb-crypto = "0.2"
 ssb-handshake = { version = "0.5", default-features = false }
 ssb-keyfile = "0.5"
 tokio = "1"

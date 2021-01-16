@@ -546,6 +546,7 @@ dependencies = [
  "private-box",
  "serde",
  "serde_json",
+ "ssb-crypto",
  "ssb-handshake",
  "ssb-keyfile",
  "tokio",

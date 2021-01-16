@@ -4,13 +4,16 @@ use pea2pea::{
     protocols::{Handshaking, Reading, ReturnableConnection, Writing},
     Node, NodeConfig, Pea2Pea,
 };
+use ssb_crypto::PublicKey;
 use ssb_keyfile::Keypair;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::*;
+use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    str,
     sync::Arc,
     time::Duration,
 };
@@ -33,7 +36,7 @@ impl ScuttleBoi {
     pub async fn new() -> io::Result<Self> {
         let node_config = NodeConfig {
             name: Some("scuttleboi".into()),
-            desired_listening_port: Some(3030),
+            desired_listening_port: Some(8008),
             allow_random_port: false,
             conn_read_buffer_size: 5000,
             ..Default::default()
@@ -49,7 +52,7 @@ impl ScuttleBoi {
         debug!(parent: node.span(), "local addr: {}", local_addr);
 
         let keypair = ssb_keyfile::generate(&mut Vec::new())?;
-        debug!(parent: node.span(), "public key: {}", keypair.public.as_base64());
+        debug!(parent: node.span(), "temporary public key: {}", keypair.public.as_base64());
 
         let ret = Self {
             node,
@@ -61,7 +64,28 @@ impl ScuttleBoi {
         Ok(ret)
     }
 
-    pub async fn start_pub_task(&self) {
+    fn read_udp_packet(&self, packet: &[u8]) -> Option<(SocketAddr, PublicKey)> {
+        if packet.starts_with(&b"net:"[..]) {
+            let packet = &packet[4..];
+            let idx = packet.iter().position(|&b| b == b'~')?;
+            let addr = str::from_utf8(&packet[..idx])
+                .ok()?
+                .parse::<SocketAddr>()
+                .ok()?;
+
+            if packet[idx + 1..].starts_with(&b"shs:"[..]) {
+                let pk = PublicKey::from_base64(str::from_utf8(&packet[idx + 5..]).ok()?)?;
+
+                Some((addr, pk))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    pub async fn start_udp_tasks(&self) {
         let udp_socket = Arc::new(
             UdpSocket::bind("0.0.0.0:8008")
                 .await
@@ -94,6 +118,7 @@ impl ScuttleBoi {
                 sleep(Duration::from_secs(1)).await;
             }
         });
+        self.tasks.lock().push(advertising_task);
 
         trace!(parent: self.node().span(), "starting the UDP advertisement reader task");
         let sb = self.clone();
@@ -101,19 +126,25 @@ impl ScuttleBoi {
             let mut buf = [0u8; 128];
 
             loop {
-                match udp_socket.try_recv(&mut buf) {
-                    Ok(n) => {
-                        info!(parent: sb.node().span(), "{:?}", &buf[..n]);
+                udp_socket
+                    .readable()
+                    .await
+                    .expect("can't check if the UDP socket is readable!");
+                match udp_socket.try_recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        if let Some((addr, pk)) = sb.read_udp_packet(&buf[..n]) {
+                            if addr.ip() != sb.local_addr {
+                                info!(parent: sb.node().span(), "found a local peer! addr: {}, pk: {}", addr, pk.as_base64());
+                            }
+                        } else {
+                            trace!(parent: sb.node().span(), "invalid UDP packet from {}", addr);
+                        }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        sleep(Duration::from_secs(1)).await
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => error!("couldn't read a UDP broadcast: {}", e),
                 }
             }
         });
-
-        self.tasks.lock().push(advertising_task);
         self.tasks.lock().push(advertisement_reader_task);
     }
 }
@@ -176,14 +207,23 @@ impl Writing for ScuttleBoi {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter.add_directive("mio=off".parse().unwrap()),
+        _ => EnvFilter::default()
+            .add_directive(LevelFilter::INFO.into())
+            .add_directive("mio=off".parse().unwrap()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 
     let sb = ScuttleBoi::new().await.unwrap();
 
     //sb.enable_reading();
     //sb.enable_writing();
 
-    sb.start_pub_task().await;
+    sb.start_udp_tasks().await;
 
     std::future::pending::<()>().await;
 }
