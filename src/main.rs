@@ -1,20 +1,34 @@
+use futures::{
+    io::{AsyncRead, AsyncWrite},
+    pin_mut,
+};
 use parking_lot::Mutex;
 use pea2pea::{
-    connections::ConnectionSide,
+    connections::{Connection, ConnectionSide},
     protocols::{Handshaking, Reading, ReturnableConnection, Writing},
     Node, NodeConfig, Pea2Pea,
 };
-use ssb_crypto::PublicKey;
+use ssb_crypto::{NetworkKey, PublicKey};
+use ssb_handshake::*;
 use ssb_keyfile::Keypair;
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::sleep};
+use tokio::{
+    io::{AsyncRead as TAR, AsyncWrite as TAW, ReadBuf},
+    net::UdpSocket,
+    sync::mpsc,
+    task::JoinHandle,
+    time::sleep,
+};
 use tracing::*;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     str,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -23,6 +37,7 @@ struct ScuttleBoi {
     node: Node,
     local_addr: IpAddr,
     keypair: Keypair,
+    peers: Arc<Mutex<HashMap<SocketAddr, PublicKey>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -58,6 +73,7 @@ impl ScuttleBoi {
             node,
             local_addr,
             keypair,
+            peers: Default::default(),
             tasks: Default::default(),
         };
 
@@ -102,8 +118,7 @@ impl ScuttleBoi {
                 "net:{}:8008~shs:{}",
                 sb.local_addr,
                 sb.keypair.public.as_base64()
-            )
-            .into_bytes();
+            );
 
             loop {
                 socket
@@ -111,9 +126,11 @@ impl ScuttleBoi {
                     .await
                     .expect("can't check if the UDP socket is writable!");
                 socket
-                    .send_to(&packet, broadcast_addr)
+                    .send_to(packet.as_bytes(), broadcast_addr)
                     .await
                     .expect("couldn't advertise my presence via UDP!");
+
+                // trace!(parent: sb.node().span(), "advertised using the following packet: {}", packet);
 
                 sleep(Duration::from_secs(1)).await;
             }
@@ -131,13 +148,14 @@ impl ScuttleBoi {
                     .await
                     .expect("can't check if the UDP socket is readable!");
                 match udp_socket.try_recv_from(&mut buf) {
-                    Ok((n, addr)) => {
+                    Ok((n, sender)) => {
                         if let Some((addr, pk)) = sb.read_udp_packet(&buf[..n]) {
                             if addr.ip() != sb.local_addr {
                                 info!(parent: sb.node().span(), "found a local peer! addr: {}, pk: {}", addr, pk.as_base64());
+                                sb.peers.lock().insert(addr, pk);
                             }
                         } else {
-                            trace!(parent: sb.node().span(), "invalid UDP packet from {}", addr);
+                            trace!(parent: sb.node().span(), "invalid UDP packet from {}", sender);
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -149,6 +167,47 @@ impl ScuttleBoi {
     }
 }
 
+// a workaround impl to enable ssb_handshake functions that expect a full socket
+struct ConnectionWrap(Connection);
+
+impl AsyncRead for ConnectionWrap {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let conn_reader = &mut self.0.reader.as_mut().unwrap().reader;
+        pin_mut!(conn_reader);
+        conn_reader
+            .poll_read(cx, &mut ReadBuf::new(buf))
+            .map(|_| Ok(buf.len()))
+    }
+}
+
+impl AsyncWrite for ConnectionWrap {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let conn_writer = &mut self.0.writer.as_mut().unwrap().writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let conn_writer = &mut self.0.writer.as_mut().unwrap().writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let conn_writer = &mut self.0.writer.as_mut().unwrap().writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_shutdown(cx)
+    }
+}
+
 impl Handshaking for ScuttleBoi {
     fn enable_handshaking(&self) {
         let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(
@@ -156,21 +215,46 @@ impl Handshaking for ScuttleBoi {
         );
 
         // spawn a background task dedicated to handling the handshakes
-        let self_clone = self.clone();
+        let sb = self.clone();
         let handshaking_task = tokio::spawn(async move {
+            let nk = NetworkKey::SSB_MAIN_NET;
+
             loop {
-                if let Some((mut conn, result_sender)) = from_node_receiver.recv().await {
-                    let peer_name = match !conn.side {
+                if let Some((conn, result_sender)) = from_node_receiver.recv().await {
+                    let mut conn = ConnectionWrap(conn);
+                    let handshake_keys = match !conn.0.side {
                         ConnectionSide::Initiator => {
-                            debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
+                            debug!(parent: conn.0.node.span(), "handshaking with {} as the initiator", conn.0.addr);
+
+                            let peer_pk = if let Some(pk) = sb.peers.lock().get(&conn.0.addr) {
+                                *pk
+                            } else {
+                                error!(
+                                    "can't connect to {}; its public key is not known",
+                                    conn.0.addr
+                                );
+                                if result_sender
+                                    .send(Err(io::ErrorKind::Other.into()))
+                                    .is_err()
+                                {
+                                    unreachable!(); // can't recover if this happens
+                                }
+                                continue;
+                            };
+
+                            client_side(&mut conn, &nk, &sb.keypair, &peer_pk).await
                         }
                         ConnectionSide::Responder => {
-                            debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
+                            debug!(parent: conn.0.node.span(), "handshaking with {} as the responder", conn.0.addr);
+
+                            server_side(&mut conn, &nk, &sb.keypair).await
                         }
                     };
 
+                    debug!(parent: sb.node().span(), "succesfully handshaken with {}", conn.0.addr);
+
                     // return the Connection to the node
-                    if result_sender.send(Ok(conn)).is_err() {
+                    if result_sender.send(Ok(conn.0)).is_err() {
                         unreachable!(); // can't recover if this happens
                     }
                 }
@@ -220,6 +304,7 @@ async fn main() {
 
     let sb = ScuttleBoi::new().await.unwrap();
 
+    sb.enable_handshaking();
     //sb.enable_reading();
     //sb.enable_writing();
 
