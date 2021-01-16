@@ -1,0 +1,15 @@
+[package]
+name = "scuttleboi"
+version = "0.1.0"
+authors = ["ljedrz <ljedrz@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+async-trait = "0.1"
+parking_lot = "0.11"
+pea2pea = "0.14"
+private-box = "0.6"
+ssb-handshake = { version = "0.5", default-features = false }
+tokio = "1"
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.2", features = ["ansi", "chrono", "env-filter", "fmt", "parking_lot", "smallvec"] }
