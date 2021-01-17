@@ -12,8 +12,9 @@ pea2pea = "0.15"
 private-box = "0.6"
 serde = "1"
 serde_json = "1"
+ssb-boxstream = "0.2"
 ssb-crypto = "0.2"
-ssb-handshake = { version = "0.5" }
+ssb-handshake = "0.5"
 ssb-keyfile = "0.5"
 tokio = "1"
 tracing = { version = "0.1", features = ["attributes"] }
