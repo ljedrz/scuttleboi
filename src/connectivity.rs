@@ -5,11 +5,14 @@ use futures::{
     pin_mut,
 };
 use pea2pea::{
-    connections::{Connection, ConnectionSide},
+    connections::{Connection, ConnectionReader, ConnectionSide, ConnectionWriter},
     protocols::{Handshaking, Reading, ReturnableConnection, Writing},
     Pea2Pea,
 };
-use ssb_crypto::NetworkKey;
+use ssb_crypto::{
+    secretbox::{Key, Nonce},
+    NetworkKey, PublicKey,
+};
 use ssb_handshake::*;
 use tokio::{
     io::{AsyncRead as TAR, AsyncWrite as TAW, ReadBuf},
@@ -23,6 +26,14 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+
+pub(crate) struct Handshake {
+    pub read_key: Key,
+    pub read_starting_nonce: Nonce,
+    pub write_key: Key,
+    pub write_starting_nonce: Nonce,
+    pub peer_key: PublicKey,
+}
 
 // a workaround impl to enable ssb_handshake functions that expect a full socket
 struct ConnectionWrap(Connection);
@@ -79,7 +90,7 @@ impl Handshaking for ScuttleBoi {
             loop {
                 if let Some((conn, result_sender)) = from_node_receiver.recv().await {
                     let mut conn = ConnectionWrap(conn);
-                    let handshake_keys = match !conn.0.side {
+                    let handshake = match !conn.0.side {
                         ConnectionSide::Initiator => {
                             debug!(parent: conn.0.node.span(), "handshaking with {} as the initiator", conn.0.addr);
 
@@ -108,6 +119,33 @@ impl Handshaking for ScuttleBoi {
                         }
                     };
 
+                    let (handshake, pk) = match handshake {
+                        Ok(hs) => {
+                            let handshake = Handshake {
+                                read_key: hs.read_key,
+                                read_starting_nonce: hs.read_starting_nonce,
+                                write_key: hs.write_key,
+                                write_starting_nonce: hs.write_starting_nonce,
+                                peer_key: hs.peer_key,
+                            };
+
+                            (handshake, hs.peer_key)
+                        }
+                        Err(e) => {
+                            error!(parent: sb.node().span(), "invalid handshake: {}", e);
+
+                            if result_sender
+                                .send(Err(io::ErrorKind::Other.into()))
+                                .is_err()
+                            {
+                                unreachable!(); // can't recover if this happens
+                            }
+                            continue;
+                        }
+                    };
+
+                    sb.handshakes.lock().insert(pk, handshake);
+
                     debug!(parent: sb.node().span(), "succesfully handshaken with {}", conn.0.addr);
 
                     // return the Connection to the node
@@ -120,6 +158,23 @@ impl Handshaking for ScuttleBoi {
 
         self.node()
             .set_handshake_handler((from_node_sender, handshaking_task).into());
+    }
+}
+
+// a workaround impl to enable box-stream functions that expect an AsyncRead
+struct ConnReaderWrap(ConnectionReader);
+
+impl AsyncRead for ConnReaderWrap {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let conn_reader = &mut self.0.reader;
+        pin_mut!(conn_reader);
+        conn_reader
+            .poll_read(cx, &mut ReadBuf::new(buf))
+            .map(|_| Ok(buf.len()))
     }
 }
 
@@ -137,6 +192,33 @@ impl Reading for ScuttleBoi {
 
     async fn process_message(&self, source: SocketAddr, message: Self::Message) -> io::Result<()> {
         unimplemented!()
+    }
+}
+
+// a workaround impl to enable box-stream functions that expect an AsyncWrite
+struct ConnWriterWrap(ConnectionWriter);
+
+impl AsyncWrite for ConnWriterWrap {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let conn_writer = &mut self.0.writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let conn_writer = &mut self.0.writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let conn_writer = &mut self.0.writer;
+        pin_mut!(conn_writer);
+        conn_writer.poll_shutdown(cx)
     }
 }
 

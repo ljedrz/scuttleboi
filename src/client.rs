@@ -1,3 +1,5 @@
+use connectivity::Handshake;
+
 use parking_lot::Mutex;
 use pea2pea::{Node, NodeConfig, Pea2Pea};
 use ssb_crypto::PublicKey;
@@ -14,13 +16,16 @@ use std::{
     time::Duration,
 };
 
+use crate::connectivity;
+
 #[derive(Clone)]
 pub struct ScuttleBoi {
     node: Node,
     pub local_addr: IpAddr,
     pub keypair: Keypair,
     pub peers: Arc<Mutex<HashMap<SocketAddr, PublicKey>>>,
-    pub tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pub(crate) handshakes: Arc<Mutex<HashMap<PublicKey, Handshake>>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Pea2Pea for ScuttleBoi {
@@ -56,6 +61,7 @@ impl ScuttleBoi {
             local_addr,
             keypair,
             peers: Default::default(),
+            handshakes: Default::default(),
             tasks: Default::default(),
         };
 
