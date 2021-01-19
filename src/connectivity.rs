@@ -28,12 +28,16 @@ use tokio_util::compat::{
 use tracing::*;
 
 use std::{
+    convert::TryInto,
     io,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
+
+const AUTH_TAG_SIZE: usize = 16;
+const BOX_HEADER_SIZE: usize = 34;
 
 #[derive(Clone)]
 pub(crate) struct Handshake {
@@ -285,9 +289,23 @@ impl Reading for ScuttleBoi {
         _source: SocketAddr,
         buffer: &[u8],
     ) -> io::Result<Option<(Self::Message, usize)>> {
-        warn!("{:?}", buffer);
+        if buffer.len() >= BOX_HEADER_SIZE {
+            let len = u16::from_be_bytes(buffer[..2].try_into().unwrap());
 
-        unimplemented!();
+            if buffer[2..].len() >= AUTH_TAG_SIZE {
+                if buffer[2 + AUTH_TAG_SIZE..].len() >= len as usize {
+                    trace!("complete message read: {:?}", buffer);
+                    unimplemented!();
+                } else {
+                    trace!("incomplete read: {:?}", buffer);
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     async fn process_message(&self, source: SocketAddr, message: Self::Message) -> io::Result<()> {
