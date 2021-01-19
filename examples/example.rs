@@ -1,6 +1,6 @@
 use scuttleboi::ScuttleBoi;
 
-use pea2pea::protocols::Handshaking;
+use pea2pea::protocols::{Handshaking, Reading, Writing};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 #[tokio::main]
@@ -19,8 +19,8 @@ async fn main() {
     let sb = ScuttleBoi::new().await.unwrap();
 
     sb.enable_handshaking();
-    //sb.enable_reading();
-    //sb.enable_writing();
+    sb.enable_reading();
+    sb.enable_writing();
 
     std::future::pending::<()>().await;
 }

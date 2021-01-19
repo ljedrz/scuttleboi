@@ -18,3 +18,6 @@ struct Address {
     port: u16,
     key: String,
 }
+
+// TODO
+pub struct Message;

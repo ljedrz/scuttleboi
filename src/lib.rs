@@ -2,4 +2,5 @@ mod client;
 mod connectivity;
 mod message;
 
-pub use crate::client::ScuttleBoi;
+pub use client::ScuttleBoi;
+pub use message::Message;
